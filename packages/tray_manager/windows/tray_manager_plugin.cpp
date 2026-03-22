@@ -57,6 +57,7 @@ class TrayManagerPlugin : public flutter::Plugin {
   int window_proc_id = -1;
 
   void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args);
+  HBITMAP TrayManagerPlugin::_LoadIconAsBitmap(const std::string& path);
   void TrayManagerPlugin::_ApplyIcon();
 
   // Called for top-level WindowProc delegation.
@@ -149,6 +150,7 @@ void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args) {
     auto* checked = std::get_if<bool>(ValueOrNull(item_map, "checked"));
     bool disabled =
         std::get<bool>(item_map.at(flutter::EncodableValue("disabled")));
+    auto* iconPath = std::get_if<std::string>(ValueOrNull(item_map, "icon"));
 
     UINT_PTR item_id = id;
     UINT uFlags = MF_STRING;
@@ -174,8 +176,64 @@ void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args) {
         item_id = reinterpret_cast<UINT_PTR>(sub_menu);
       }
       AppendMenuW(menu, uFlags, item_id, g_converter.from_bytes(label).c_str());
+      
+      // apply icon bitmap if provided.
+      if (iconPath != nullptr && !iconPath->empty()) {
+        HBITMAP hBmp = _LoadIconAsBitmap(*iconPath);
+        if (hBmp != NULL) {
+          MENUITEMINFO mii  = {};
+          mii.cbSize        = sizeof(MENUITEMINFO);
+          mii.fMask         = MIIM_BITMAP;
+          mii.hbmpItem      = hBmp;
+          // Use item position (count before this append) because submenus
+          // changed item_id to the HMENU pointer — safer to use MF_BYPOSITION.
+          SetMenuItemInfo(menu,
+                          static_cast<UINT>(GetMenuItemCount(menu) - 1),
+                          TRUE,  // fByPosition
+                          &mii);
+        }
+      }
     }
   }
+}
+
+// Loads a .ico file and converts it to a 16x16 32bpp HBITMAP suitable
+// for MENUITEMINFO.hbmpItem (which requires a bitmap, not an HICON).
+
+HBITMAP TrayManagerPlugin::_LoadIconAsBitmap(const std::string& path) {
+  std::wstring wpath = g_converter.from_bytes(path);
+
+  HICON hIcon = static_cast<HICON>(
+      LoadImage(NULL, wpath.c_str(), IMAGE_ICON, 16, 16, LR_LOADFROMFILE));
+  if (!hIcon) return NULL;
+
+  // Create a 32bpp DIB section so alpha channel is preserved correctly.
+  BITMAPINFO bmi = {};
+  bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+  bmi.bmiHeader.biWidth       = 16;
+  bmi.bmiHeader.biHeight      = -16; // top-down
+  bmi.bmiHeader.biPlanes      = 1;
+  bmi.bmiHeader.biBitCount    = 32;
+  bmi.bmiHeader.biCompression = BI_RGB;
+
+  HDC     hdc    = GetDC(NULL);
+  HDC     hdcMem = CreateCompatibleDC(hdc);
+  void*   bits   = nullptr;
+  HBITMAP hBmp   = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+
+  if (hBmp) {
+    HBITMAP hOld = static_cast<HBITMAP>(SelectObject(hdcMem, hBmp));
+    // Fill transparent first, then draw icon on top.
+    RECT rc = {0, 0, 16, 16};
+    FillRect(hdcMem, &rc, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+    DrawIconEx(hdcMem, 0, 0, hIcon, 16, 16, 0, NULL, DI_NORMAL);
+    SelectObject(hdcMem, hOld);
+  }
+
+  DeleteDC(hdcMem);
+  ReleaseDC(NULL, hdc);
+  DestroyIcon(hIcon);
+  return hBmp;
 }
 
 std::optional<LRESULT> TrayManagerPlugin::HandleWindowProc(HWND hWnd,
