@@ -393,11 +393,6 @@ void TrayManagerPlugin::SetContextMenu(
 void TrayManagerPlugin::PopUpContextMenu(
     const flutter::MethodCall<flutter::EncodableValue>& method_call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  const flutter::EncodableMap& args =
-      std::get<flutter::EncodableMap>(*method_call.arguments());
-
-  bool bringAppToFront =
-      std::get<bool>(args.at(flutter::EncodableValue("bringAppToFront")));
 
   HWND hWnd = GetMainWindow();
 
@@ -414,11 +409,16 @@ void TrayManagerPlugin::PopUpContextMenu(
   x = cursorPos.x;
   y = cursorPos.y;
 
-  if (bringAppToFront) {
-    SetForegroundWindow(hWnd);
-  }
+  // Always required — TrackPopupMenu won't dismiss on outside
+  // click unless the window is foreground, regardless of bringAppToFront.
+  SetForegroundWindow(hWnd);
+
   TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, static_cast<int>(x),
                  static_cast<int>(y), 0, hWnd, NULL);
+  // Required to flush the menu message loop properly —
+  // without this the next right-click may not open the menu.
+  PostMessageW(hWnd, WM_NULL, 0, 0);
+
   result->Success(flutter::EncodableValue(true));
 }
 
