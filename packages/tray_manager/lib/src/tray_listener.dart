@@ -12,4 +12,9 @@ abstract mixin class TrayListener {
   void onTrayIconRightMouseUp() {}
 
   void onTrayMenuItemClick(MenuItem menuItem) {}
+
+  /// Emitted when the Windows system (taskbar) theme switches between light
+  /// and dark. Use it to reset theme depentant menu
+  /// icons via [TrayManager.setContextMenu]. Windows only.
+  void onTrayThemeChanged(bool isSystemThemeLight) {}
 }

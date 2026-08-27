@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <vector>
 
 #define WM_MYMESSAGE (WM_USER + 1)
 
@@ -29,6 +30,14 @@ const flutter::EncodableValue* ValueOrNull(const flutter::EncodableMap& map,
   }
   return &(it->second);
 }
+
+// Undocumented uxtheme.dll APIs (Windows 10 1809+). Win32 popup menus are
+// light-only unless the process opts in through these; they are also the only
+// way to un-stick a mode another component already forced, since the setting
+// is process-wide.
+enum class PreferredAppMode { Default, AllowDark, ForceDark, ForceLight, Max };
+typedef PreferredAppMode(WINAPI* FnSetPreferredAppMode)(PreferredAppMode);
+typedef void(WINAPI* FnFlushMenuThemes)();
 std::unique_ptr<
     flutter::MethodChannel<flutter::EncodableValue>,
     std::default_delete<flutter::MethodChannel<flutter::EncodableValue>>>
@@ -50,6 +59,9 @@ class TrayManagerPlugin : public flutter::Plugin {
   NOTIFYICONIDENTIFIER niif;
   // do create pop-up menu only once.
   HMENU hMenu = CreatePopupMenu();
+  // Menu items don't own their hbmpItem bitmaps — we do; freed on rebuild.
+  std::vector<HBITMAP> menu_bitmaps;
+  bool last_system_light_theme = false;
   bool tray_icon_setted = false;
   UINT windows_taskbar_created_message_id = 0;
 
@@ -59,6 +71,8 @@ class TrayManagerPlugin : public flutter::Plugin {
   void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args);
   HBITMAP TrayManagerPlugin::_LoadIconAsBitmap(const std::string& path);
   void TrayManagerPlugin::_ApplyIcon();
+  bool TrayManagerPlugin::_IsSystemLightTheme();
+  void TrayManagerPlugin::_UpdateMenuTheme();
 
   // Called for top-level WindowProc delegation.
   std::optional<LRESULT> TrayManagerPlugin::HandleWindowProc(HWND hwnd,
@@ -123,6 +137,7 @@ TrayManagerPlugin::TrayManagerPlugin(flutter::PluginRegistrarWindows* registrar)
         return HandleWindowProc(hwnd, message, wparam, lparam);
       });
   windows_taskbar_created_message_id = RegisterWindowMessage(L"TaskbarCreated");
+  last_system_light_theme = _IsSystemLightTheme();
 }
 
 TrayManagerPlugin::~TrayManagerPlugin() {
@@ -135,8 +150,9 @@ void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args) {
 
   int count = GetMenuItemCount(menu);
   for (int i = 0; i < count; i++) {
-    // always remove at 0 because they shift every time
-    RemoveMenu(menu, 0, MF_BYPOSITION);
+    // always delete at 0 because they shift every time. DeleteMenu (unlike
+    // RemoveMenu) also destroys submenu handles, which would leak otherwise.
+    DeleteMenu(menu, 0, MF_BYPOSITION);
   }
 
   for (flutter::EncodableValue item_value : items) {
@@ -191,6 +207,7 @@ void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args) {
                           static_cast<UINT>(GetMenuItemCount(menu) - 1),
                           TRUE,  // fByPosition
                           &mii);
+          menu_bitmaps.push_back(hBmp);
         }
       }
     }
@@ -236,6 +253,45 @@ HBITMAP TrayManagerPlugin::_LoadIconAsBitmap(const std::string& path) {
   return hBmp;
 }
 
+bool TrayManagerPlugin::_IsSystemLightTheme() {
+  DWORD value = 0;
+  DWORD size = sizeof(value);
+  // The taskbar/tray follows "SystemUsesLightTheme", not "AppsUseLightTheme".
+  LSTATUS status = RegGetValueW(
+      HKEY_CURRENT_USER,
+      L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+      L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size);
+  return status == ERROR_SUCCESS && value == 1;
+}
+
+void TrayManagerPlugin::_UpdateMenuTheme() {
+  static bool loaded = false;
+  static FnSetPreferredAppMode set_preferred_app_mode = nullptr;
+  static FnFlushMenuThemes flush_menu_themes = nullptr;
+  if (!loaded) {
+    loaded = true;
+    HMODULE uxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr,
+                                     LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (uxtheme != nullptr) {
+      set_preferred_app_mode = reinterpret_cast<FnSetPreferredAppMode>(
+          GetProcAddress(uxtheme, MAKEINTRESOURCEA(135)));
+      flush_menu_themes = reinterpret_cast<FnFlushMenuThemes>(
+          GetProcAddress(uxtheme, MAKEINTRESOURCEA(136)));
+    }
+  }
+  if (set_preferred_app_mode == nullptr) {
+    // Pre-1809 Windows 10: menus stay light, nothing to do.
+    return;
+  }
+  // Process-wide; re-applied before every popup so it tracks live theme
+  // changes and wins over any mode another plugin forced earlier.
+  set_preferred_app_mode(_IsSystemLightTheme() ? PreferredAppMode::ForceLight
+                                               : PreferredAppMode::ForceDark);
+  if (flush_menu_themes != nullptr) {
+    flush_menu_themes();
+  }
+}
+
 std::optional<LRESULT> TrayManagerPlugin::HandleWindowProc(HWND hWnd,
                                                            UINT message,
                                                            WPARAM wParam,
@@ -266,6 +322,23 @@ std::optional<LRESULT> TrayManagerPlugin::HandleWindowProc(HWND hWnd,
       default:
         return DefWindowProc(hWnd, message, wParam, lParam);
     };
+  } else if (message == WM_SETTINGCHANGE) {
+    // Broadcast with "ImmersiveColorSet" whenever the system/apps theme
+    // changes (several times per change, so dedupe against the last value).
+    if (lParam != 0 &&
+        lstrcmpiW(reinterpret_cast<LPCWSTR>(lParam), L"ImmersiveColorSet") ==
+            0) {
+      bool is_light = _IsSystemLightTheme();
+      if (is_light != last_system_light_theme) {
+        last_system_light_theme = is_light;
+        flutter::EncodableMap eventData = flutter::EncodableMap();
+        eventData[flutter::EncodableValue("isLight")] =
+            flutter::EncodableValue(is_light);
+        channel->InvokeMethod(
+            "onTrayThemeChanged",
+            std::make_unique<flutter::EncodableValue>(eventData));
+      }
+    }
   } else if (message == windows_taskbar_created_message_id) {
     if (windows_taskbar_created_message_id != 0 && tray_icon_setted) {
       // restore the icon with the existing resource.
@@ -384,8 +457,17 @@ void TrayManagerPlugin::SetContextMenu(
   const flutter::EncodableMap& args =
       std::get<flutter::EncodableMap>(*method_call.arguments());
 
+  std::vector<HBITMAP> old_bitmaps = std::move(menu_bitmaps);
+  menu_bitmaps.clear();
+
   _CreateMenu(hMenu, std::get<flutter::EncodableMap>(
                          args.at(flutter::EncodableValue("menu"))));
+
+  // Free the previous generation only after the items referencing them are
+  // gone — the menu can be rebuilt while it is visible.
+  for (HBITMAP bmp : old_bitmaps) {
+    DeleteObject(bmp);
+  }
 
   result->Success(flutter::EncodableValue(true));
 }
@@ -408,6 +490,9 @@ void TrayManagerPlugin::PopUpContextMenu(
   GetCursorPos(&cursorPos);
   x = cursorPos.x;
   y = cursorPos.y;
+
+  // Match the menu theme to the current system (taskbar) theme.
+  _UpdateMenuTheme();
 
   // Always required — TrackPopupMenu won't dismiss on outside
   // click unless the window is foreground, regardless of bringAppToFront.

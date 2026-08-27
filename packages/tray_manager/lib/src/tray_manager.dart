@@ -16,6 +16,7 @@ const kEventOnTrayIconMouseUp = 'onTrayIconMouseUp';
 const kEventOnTrayIconRightMouseDown = 'onTrayIconRightMouseDown';
 const kEventOnTrayIconRightMouseUp = 'onTrayIconRightMouseUp';
 const kEventOnTrayMenuItemClick = 'onTrayMenuItemClick';
+const kEventOnTrayThemeChanged = 'onTrayThemeChanged';
 
 enum TrayIconPosition { left, right }
 
@@ -68,6 +69,10 @@ class TrayManager {
               await setContextMenu(_menu!);
             }
           }
+          break;
+        case kEventOnTrayThemeChanged:
+          bool isLight = call.arguments['isLight'];
+          listener.onTrayThemeChanged(isLight);
           break;
       }
     }
